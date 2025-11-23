@@ -1,12 +1,5 @@
 // VFDMonitorApp.java
-// Full updated version including:
-// - Real-time polling charts
-// - Configurable baud/parity/address/poll interval
-// - Modbus exception popup alerts
-// - Fault log table with timestamps
-// - Forward/Reverse/Stop/Fault Reset
-// - Frequency setting
-// - Uses ModbusRTU.java
+
 
 import com.fazecast.jSerialComm.SerialPort;
 import javafx.application.Application;
