@@ -1,8 +1,7 @@
 // ModbusRTU.java
-// Simple Modbus RTU helper using jSerialComm
+// 
 
 import com.fazecast.jSerialComm.SerialPort;
-
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.concurrent.locks.ReentrantLock;
@@ -13,8 +12,7 @@ public class ModbusRTU {
     private final int slaveAddress;
     private final ReentrantLock commLock = new ReentrantLock();
 
-    // timeout for reading response (ms)
-    private int timeoutMs = 500;
+    private int timeoutMs = 600;
 
     public ModbusRTU(SerialPort serial, int slaveAddress) {
         this.serial = serial;
@@ -22,130 +20,133 @@ public class ModbusRTU {
     }
 
     public void setTimeout(int ms) {
-        this.timeoutMs = ms;
+        timeoutMs = ms;
     }
 
-    /**
-     * Read N words (16-bit) starting at register startAddr.
-     * Returns int[] of length count with unsigned 16-bit values.
-     */
+    // -------------------------------------------------------------------------
+    //  Exception code decoder (from FC01-Series-VFD.pdf, page 87)
+    // -------------------------------------------------------------------------
+    private String decodeExceptionCode(int code) {
+        return switch (code) {
+            case 0x01 -> "Illegal command";
+            case 0x02 -> "Illegal data address";
+            case 0x03 -> "Illegal value / bad frame";
+            case 0x04 -> "Operation failed";
+            case 0x05 -> "Password error";
+            case 0x06 -> "Data frame error / CRC mismatch";
+            case 0x07 -> "Write not allowed";
+            case 0x08 -> "Parameter cannot be modified during running";
+            case 0x09 -> "Password protection active";
+            default -> "Unknown exception code: " + code;
+        };
+    }
+
+    // -------------------------------------------------------------------------
+    //  READ HOLDING REGISTERS (0x03)
+    // -------------------------------------------------------------------------
     public int[] readHoldingRegisters(int startAddr, int count) throws IOException {
-        if (count <= 0 || count > 125) throw new IllegalArgumentException("Count out of range");
+        if (count < 1 || count > 125)
+            throw new IOException("Invalid register count: " + count);
 
         byte[] frame = new byte[8];
         frame[0] = (byte) slaveAddress;
-        frame[1] = 0x03; // function code
-        frame[2] = (byte) ((startAddr >> 8) & 0xFF);
+        frame[1] = 0x03;
+        frame[2] = (byte) (startAddr >> 8);
         frame[3] = (byte) (startAddr & 0xFF);
-        frame[4] = (byte) ((count >> 8) & 0xFF);
+        frame[4] = (byte) (count >> 8);
         frame[5] = (byte) (count & 0xFF);
-
         appendCRC(frame, 6);
 
         byte[] resp = transact(frame);
 
-        // Expected response: addr, func, byteCount, data..., CRClo, CRChi
-        if (resp == null || resp.length < 5) throw new IOException("Invalid response length");
-        if ((resp[1] & 0xFF) == (0x83)) { // exception (0x80 + function)
+        if ((resp[1] & 0x80) != 0) {   // Exception response
             int ex = resp[2] & 0xFF;
-            throw new IOException("Modbus exception response: " + ex);
+            throw new IOException("VFD Exception: " + decodeExceptionCode(ex));
         }
-        if ((resp[1] & 0xFF) != 0x03) throw new IOException("Unexpected function in response");
+
+        if (resp[1] != 0x03)
+            throw new IOException("Unexpected function: " + resp[1]);
 
         int byteCount = resp[2] & 0xFF;
-        if (byteCount != count * 2) {
-            throw new IOException("Unexpected byte count: " + byteCount + " expected " + (count*2));
-        }
+        if (byteCount != count * 2)
+            throw new IOException("Incorrect byte count");
 
         int[] out = new int[count];
         for (int i = 0; i < count; i++) {
-            int hi = resp[3 + i*2] & 0xFF;
-            int lo = resp[3 + i*2 + 1] & 0xFF;
+            int hi = resp[3 + i * 2] & 0xFF;
+            int lo = resp[3 + i * 2 + 1] & 0xFF;
             out[i] = (hi << 8) | lo;
         }
 
         return out;
     }
 
-    /**
-     * Write single register (function 0x06).
-     * value is 16-bit unsigned.
-     */
+    // -------------------------------------------------------------------------
+    //  WRITE SINGLE REGISTER (0x06)
+    // -------------------------------------------------------------------------
     public void writeSingleRegister(int addr, int value) throws IOException {
         byte[] frame = new byte[8];
         frame[0] = (byte) slaveAddress;
         frame[1] = 0x06;
-        frame[2] = (byte) ((addr >> 8) & 0xFF);
+        frame[2] = (byte) (addr >> 8);
         frame[3] = (byte) (addr & 0xFF);
-        frame[4] = (byte) ((value >> 8) & 0xFF);
+        frame[4] = (byte) (value >> 8);
         frame[5] = (byte) (value & 0xFF);
-
         appendCRC(frame, 6);
 
         byte[] resp = transact(frame);
 
-        // Response should mirror the request (same 8 bytes)
-        if (resp == null || resp.length < 8) throw new IOException("Invalid write response");
-        // check function code
-        if ((resp[1] & 0xFF) == 0x86) { // exception for 0x06 (0x80 + 0x06 = 0x86)
+        if ((resp[1] & 0x80) != 0) {
             int ex = resp[2] & 0xFF;
-            throw new IOException("Modbus exception write: " + ex);
+            throw new IOException("VFD Exception: " + decodeExceptionCode(ex));
         }
-        if (resp[1] != 0x06) throw new IOException("Unexpected function in write response");
-        // Could further validate address/value echo if needed
+
+        if (resp[1] != 0x06)
+            throw new IOException("Unexpected write response");
     }
 
-    // Core transaction: write frame and read response (synchronized)
+    // -------------------------------------------------------------------------
+    //  CORE TRANSACTION
+    // -------------------------------------------------------------------------
     private byte[] transact(byte[] frame) throws IOException {
         commLock.lock();
         try {
             flushInput();
 
             int written = serial.writeBytes(frame, frame.length);
-            if (written != frame.length) {
-                throw new IOException("Failed to write whole frame to serial (written=" + written + ")");
-            }
+            if (written != frame.length)
+                throw new IOException("Write failed (serial error)");
 
             long start = System.currentTimeMillis();
-            // Read loop until timeout or when we detect a full response (using minimal checks)
-            // We'll accumulate bytes until no new bytes arrive for 30ms after at least 5 bytes
-            byte[] buffer = new byte[512];
+            byte[] buf = new byte[256];
             int offset = 0;
-            long lastReadTime = System.currentTimeMillis();
+            long last = System.currentTimeMillis();
 
             while (System.currentTimeMillis() - start < timeoutMs) {
                 int avail = serial.bytesAvailable();
                 if (avail > 0) {
-                    int toRead = Math.min(avail, buffer.length - offset);
-                    int r = serial.readBytes(buffer, toRead, offset);
+                    int r = serial.readBytes(buf, avail, offset);
                     if (r > 0) {
                         offset += r;
-                        lastReadTime = System.currentTimeMillis();
+                        last = System.currentTimeMillis();
                     }
-                } else {
-                    // small delay to allow bytes to arrive
-                    try { Thread.sleep(10); } catch (InterruptedException ignored) {}
                 }
+                if (offset >= 5 && System.currentTimeMillis() - last > 40)
+                    break;
 
-                // Heuristic: if we have >=5 bytes and no bytes for 30ms, assume frame complete
-                if (offset >= 5 && (System.currentTimeMillis() - lastReadTime) > 30) break;
+                try { Thread.sleep(5); } catch (Exception ignored) {}
             }
 
-            if (offset == 0) return null;
+            if (offset < 3)
+                throw new IOException("No response from device");
 
-            byte[] resp = Arrays.copyOf(buffer, offset);
+            byte[] resp = Arrays.copyOf(buf, offset);
 
-            // verify CRC
-            if (offset >= 2) {
-                int crcIndex = offset - 2;
-                int calc = calcCRC(resp, 0, crcIndex);
-                int recv = ((resp[crcIndex + 1] & 0xFF) << 8) | (resp[crcIndex] & 0xFF);
-                if (calc != recv) {
-                    throw new IOException("CRC mismatch: calc=" + Integer.toHexString(calc) + " recv=" + Integer.toHexString(recv));
-                }
-            } else {
-                throw new IOException("Response too short for CRC check");
-            }
+            int crcPos = offset - 2;
+            int crcCalc = calcCRC(resp, 0, crcPos);
+            int crcRecv = ((resp[crcPos + 1] & 0xFF) << 8) | (resp[crcPos] & 0xFF);
+            if (crcCalc != crcRecv)
+                throw new IOException("CRC mismatch");
 
             return resp;
 
@@ -154,31 +155,31 @@ public class ModbusRTU {
         }
     }
 
-    // small helper - clear input buffer
+    // -------------------------------------------------------------------------
+    //  HELPERS
+    // -------------------------------------------------------------------------
     private void flushInput() {
-        try { Thread.sleep(5); } catch (InterruptedException ignored) {}
-        int avail = serial.bytesAvailable();
-        if (avail > 0) {
-            byte[] tmp = new byte[avail];
-            serial.readBytes(tmp, tmp.length);
+        try { Thread.sleep(3); } catch (Exception ignored) {}
+        int n = serial.bytesAvailable();
+        if (n > 0) {
+            byte[] tmp = new byte[n];
+            serial.readBytes(tmp, n);
         }
     }
 
-    // Append CRC low, CRC high into dest[ pos .. pos+1 ]
-    private void appendCRC(byte[] dest, int pos) {
-        int crc = calcCRC(dest, 0, pos);
-        dest[pos] = (byte) (crc & 0xFF); // CRC low
-        dest[pos + 1] = (byte) ((crc >> 8) & 0xFF); // CRC high
+    private void appendCRC(byte[] arr, int pos) {
+        int crc = calcCRC(arr, 0, pos);
+        arr[pos] = (byte) (crc & 0xFF);
+        arr[pos + 1] = (byte) ((crc >> 8) & 0xFF);
     }
 
-    // Calculate CRC for bytes [off .. off+len-1]
-    private int calcCRC(byte[] data, int off, int len) {
+    private int calcCRC(byte[] arr, int off, int len) {
         int crc = 0xFFFF;
         for (int i = off; i < off + len; i++) {
-            crc ^= (data[i] & 0xFF);
-            for (int b = 0; b < 8; b++) {
-                if ((crc & 0x0001) != 0) crc = (crc >> 1) ^ 0xA001;
-                else crc = (crc >> 1);
+            crc ^= (arr[i] & 0xFF);
+            for (int j = 0; j < 8; j++) {
+                if ((crc & 1) != 0) crc = (crc >> 1) ^ 0xA001;
+                else crc >>= 1;
             }
         }
         return crc & 0xFFFF;
