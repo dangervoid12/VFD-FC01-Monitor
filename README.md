@@ -1,2 +1,2 @@
 # VFD-FC01-Monitor
-Huanyang FC01 modbus monitor app
+Huanyang FC01 modbus monitor app in java 
